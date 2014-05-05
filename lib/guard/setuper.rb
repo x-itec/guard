@@ -27,7 +27,7 @@ module Guard
     # Initializes the Guard singleton:
     #
     # * Initialize the internal Guard state;
-    # * Create the interactor when necessary for user interaction;
+    # * Create the interactor
     # * Select and initialize the file change listener.
     #
     # @option options [Boolean] clear if auto clear the UI should be done
@@ -40,12 +40,15 @@ module Guard
     # @return [Guard] the Guard singleton
     #
     def setup(opts = {})
-      _reset_lazy_accessors
+      @options    = nil
+      @evaluator  = nil
+      @interactor = nil
       @running   = true
       @lock      = Mutex.new
       @opts      = opts
       @watchdirs = [Dir.pwd]
       @runner    = ::Guard::Runner.new
+      @queue = Queue.new
 
       if options[:watchdir]
         # Ensure we have an array
@@ -85,9 +88,8 @@ module Guard
     # Lazy initializer the interactor unless the user has specified not to.
     #
     def interactor
-      return if options[:no_interactions] || !::Guard::Interactor.enabled
-
-      @interactor ||= ::Guard::Interactor.new
+      non_interactive = options[:no_interactions] || !::Guard::Interactor.enabled
+      @interactor ||= ::Guard::Interactor.new(non_interactive)
     end
 
     # Clear Guard's options hash
@@ -147,13 +149,16 @@ module Guard
       ::Guard::UI.error 'No plugins found in Guardfile, please add at least one.' if plugins.empty?
     end
 
-    private
+    # Asynchronously trigger changes
+    def queue_add(changes)
+      @queue << changes
 
-    def _reset_lazy_accessors
-      @options    = nil
-      @evaluator  = nil
-      @interactor = nil
+      # putting interactor in background puts guard into foreground
+      # so it can handle change notifications
+      interactor.background
     end
+
+    private
 
     # Sets up various debug behaviors:
     #
@@ -173,23 +178,7 @@ module Guard
     #
     def _setup_listener
       listener_callback = lambda do |modified, added, removed|
-        # Convert to relative paths (respective to the watchdir it came from)
-        @watchdirs.each do |watchdir|
-          [modified, added, removed].each do |paths|
-            paths.map! do |path|
-              if path.start_with? watchdir
-                path.sub "#{watchdir}#{File::SEPARATOR}", ''
-              else
-                path
-              end
-            end
-          end
-        end
-        evaluator.reevaluate_guardfile if ::Guard::Watcher.match_guardfile?(modified)
-
-        within_preserved_state do
-          runner.run_on_changes(modified, added, removed)
-        end
+        queue_add(modified: modified, added: added, removed:removed)
       end
 
       if options[:listen_on]
@@ -203,6 +192,42 @@ module Guard
         @listener = Listen.to(*listen_args, &listener_callback)
       end
     end
+
+    # Process the change queue, running tasks within the main Guard thread
+    def _process_queue
+      all_changes = {modified: [], added: [], removed: []}
+
+      while ! @queue.empty?
+        new_changes = @queue.pop
+        new_changes.each do |key, value|
+          all_changes[key] += value
+        end
+      end
+
+      modified = all_changes[:modified].dup
+      added = all_changes[:added].dup
+      removed = all_changes[:removed].dup
+
+      # Convert to relative paths (respective to the watchdir it came from)
+      @watchdirs.each do |watchdir|
+        [modified, added, removed].each do |paths|
+          paths.map! do |path|
+            if path.start_with? watchdir
+              path.sub "#{watchdir}#{File::SEPARATOR}", ''
+            else
+              path
+            end
+          end
+        end
+      end
+
+      if ::Guard::Watcher.match_guardfile?(modified)
+        evaluator.reevaluate_guardfile
+      end
+
+      runner.run_on_changes(modified, added, removed)
+    end
+
 
     # Sets up traps to catch signals used to control Guard.
     #
@@ -223,11 +248,7 @@ module Guard
 
         if Signal.list.keys.include?('INT')
           Signal.trap('INT') do
-            if interactor && interactor.thread
-              interactor.thread.raise(Interrupt)
-            else
-              ::Guard.stop
-            end
+            interactor.handle_interrupt
           end
         end
       end
